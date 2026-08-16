@@ -317,12 +317,11 @@ create policy "recipe_items_delete_via_recipe"
 create table journal_days (
   id uuid primary key default uuid_generate_v7(),
   profile_id uuid not null references profiles(id) on delete cascade,
-  date date not null,
+  date date not null,  -- "clôture" = date + 1 jour de grâce, calculée à la volée, jamais stockée (voir policies)
   total_kcal numeric not null default 0,
   total_protein numeric not null default 0,
   total_carbs numeric not null default 0,
   total_fat numeric not null default 0,
-  is_closed boolean not null default false,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   unique (profile_id, date)
@@ -340,21 +339,11 @@ create policy "journal_days_insert_own"
   on journal_days for insert
   with check (profile_id = (select id from profiles where user_id = auth.uid()));
 
--- is_closed ne peut être posé qu'une fois : dès que true, la ligne sort du
--- périmètre "using" et n'est plus jamais modifiable par l'utilisateur — clôture définitive.
-create policy "journal_days_update_own"
-  on journal_days for update
-  using (
-    profile_id = (select id from profiles where user_id = auth.uid())
-    and is_closed = false
-  )
-  with check (profile_id = (select id from profiles where user_id = auth.uid()));
-
 create policy "journal_days_delete_own"
   on journal_days for delete
   using (
     profile_id = (select id from profiles where user_id = auth.uid())
-    and is_closed = false
+    and current_date <= date + 1
   );
 
 -- ============================================================
@@ -392,16 +381,15 @@ create policy "journal_entries_select_via_day"
     select id from journal_days where profile_id = (select id from profiles where user_id = auth.uid())
   ));
 
--- insert/update/delete : uniquement tant que le jour du journal est "aujourd'hui" et pas clôturé.
--- Passé minuit (date != current_date) ou une fois is_closed = true, l'entrée devient immuable —
--- c'est ça qui fait office de "snapshot" figé pour snapshot_kcal/protein/carbs/fat.
+-- insert/update/delete : autorisé le jour même de journal_days.date ET le lendemain (jour de grâce jusqu'à 23h59)
+-- Calculé à la volée sur `date`, Passé ce délai, l'entrée devient immuable
+-- fait office de "snapshot" figé pour snapshot_kcal/protein/carbs/fat.
 create policy "journal_entries_insert_via_day"
   on journal_entries for insert
   with check (journal_day_id in (
     select id from journal_days
     where profile_id = (select id from profiles where user_id = auth.uid())
-      and is_closed = false
-      and date = current_date
+      and current_date <= date + 1
   ));
 
 create policy "journal_entries_update_via_day"
@@ -409,14 +397,12 @@ create policy "journal_entries_update_via_day"
   using (journal_day_id in (
     select id from journal_days
     where profile_id = (select id from profiles where user_id = auth.uid())
-      and is_closed = false
-      and date = current_date
+      and current_date <= date + 1
   ))
   with check (journal_day_id in (
     select id from journal_days
     where profile_id = (select id from profiles where user_id = auth.uid())
-      and is_closed = false
-      and date = current_date
+      and current_date <= date + 1
   ));
 
 create policy "journal_entries_delete_via_day"
@@ -424,8 +410,7 @@ create policy "journal_entries_delete_via_day"
   using (journal_day_id in (
     select id from journal_days
     where profile_id = (select id from profiles where user_id = auth.uid())
-      and is_closed = false
-      and date = current_date
+      and current_date <= date + 1
   ));
 
 -- ============================================================
@@ -496,7 +481,10 @@ create trigger recipe_items_recalc_cache
   after insert or update or delete on recipe_items
   for each row execute function recalc_recipe_cache();
 
--- 2. Agrégat du jour, upsert live tant que non clôturé (figé après clôture)
+-- 2. Agrégat du jour, upsert live tant que non clôturé (figé après clôture).
+-- Garde-fou utile même si la RLS bloque déjà les écritures normales passé le délai :
+-- un `on delete set null` (food/recipe supprimée) ou une écriture service_role
+-- contournent la RLS mais déclenchent quand même ce trigger.
 create or replace function recalc_journal_day()
 returns trigger
 language plpgsql
@@ -505,14 +493,14 @@ set search_path = ''
 as $$
 declare
   target_day_id uuid;
-  is_day_closed boolean;
+  day_date date;
 begin
   target_day_id := coalesce(new.journal_day_id, old.journal_day_id);
 
-  select is_closed into is_day_closed from public.journal_days where id = target_day_id;
+  select date into day_date from public.journal_days where id = target_day_id;
 
-  if is_day_closed then
-    return null;  -- jour clôturé : agrégat figé, on ne recalcule plus
+  if current_date > day_date + 1 then
+    return null;  -- jour clôturé (au-delà du jour de grâce) : agrégat figé, on ne recalcule plus
   end if;
 
   update public.journal_days jd
@@ -566,6 +554,3 @@ create trigger recipes_set_updated_at before update on recipes
 
 revoke update on table recipes from authenticated;
 grant update (name, servings, is_shared) on table recipes to authenticated;
-
-revoke update on table journal_days from authenticated;
-grant update (is_closed) on table journal_days to authenticated;
