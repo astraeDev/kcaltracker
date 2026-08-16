@@ -1,17 +1,37 @@
--- ============================================================
--- KcalTracker — Schéma initial (MVP + préparation V1.5)
--- v2 : OpenFoodFacts retiré du schéma, macros cachées sur foods,
---      nutrients = table complète (brute + convertie) par aliment
--- ============================================================
-
 create extension if not exists "pgcrypto";
 create extension if not exists "pg_trgm";
+
+-- ============================================================
+-- UUID v7
+-- ============================================================
+-- quand PG18 est dispo, remplacer le corps par `select uuidv7();`
+create or replace function uuid_generate_v7()
+returns uuid
+language sql
+volatile
+set search_path = ''
+as $$
+  select encode(
+    set_bit(
+      set_bit(
+        overlay(
+          uuid_send(gen_random_uuid())
+          placing substring(int8send(floor(extract(epoch from clock_timestamp()) * 1000)::bigint) from 3)
+          from 1 for 6
+        ),
+        52, 1
+      ),
+      53, 1
+    ),
+    'hex'
+  )::uuid;
+$$;
 
 -- ============================================================
 -- ENUMS
 -- ============================================================
 
-create type sex_enum as enum ('male', 'female');
+create type gender_enum as enum ('male', 'female');
 
 create type activity_level_enum as enum (
   'sedentary',   -- sédentaire
@@ -21,11 +41,9 @@ create type activity_level_enum as enum (
   'extreme'      -- extrêmement actif (2x/jour)
 );
 
-create type goal_type_enum as enum ('maintenance', 'surplus', 'deficit');
+create type goal_type_enum as enum ('maintain', 'gain', 'lose');
 
 create type food_source_enum as enum ('ciqual', 'user');
--- ⚠️ 'openfoodfacts' retiré volontairement. Réintroduction en V2 = simple migration
---    (ALTER TYPE food_source_enum ADD VALUE 'openfoodfacts').
 
 create type unit_type_enum as enum ('grams', 'ml', 'unit');
 
@@ -40,19 +58,19 @@ create type confidence_code_enum as enum ('A', 'B', 'C', 'D');
 -- ============================================================
 
 create table profiles (
-  id uuid primary key default gen_random_uuid(),
+  id uuid primary key default uuid_generate_v7(),
   user_id uuid not null unique references auth.users(id) on delete cascade,
   name text,
   avatar_url text,
   bio text,
   is_public boolean not null default false,
-  sex sex_enum not null,
-  birth_date date not null,               -- indispensable au calcul du BMR
+  gender gender_enum not null,
+  birth_date date not null,
   height_cm numeric not null,
   weight_kg numeric not null,
   activity_level activity_level_enum not null,
-  goal_type goal_type_enum not null default 'maintenance',
-  daily_kcal_target numeric,
+  goal_type goal_type_enum not null default 'maintain',
+  daily_kcal_target numeric not null,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -78,24 +96,21 @@ create policy "profiles_delete_own"
 
 -- ============================================================
 -- FOODS
--- Table de référence utilisée par tous les composants de l'app.
--- Contient les 5 macros principales EN CACHE (copie dérivée de `nutrients`
--- pour les aliments CIQUAL, saisie directe pour les aliments perso).
 -- ============================================================
 
 create table foods (
-  id bigint generated always as identity primary key,
+  id uuid primary key default uuid_generate_v7(),
   name text not null,
   owner_profile_id uuid references profiles(id) on delete cascade,  -- null si CIQUAL
   source food_source_enum not null default 'user',
   external_id text,                        -- alim_code CIQUAL, clé stable pour upsert
-  is_shared boolean not null default false,   -- préparation V1.5, aucune logique/UI dessus en MVP
-  is_public boolean not null default false,   -- true pour les aliments CIQUAL/seed
+  is_shared boolean not null default false,   
+  is_public boolean not null default false,   -- true pour les aliments CIQUAL
 
   unit_type unit_type_enum not null default 'grams',
-  density_g_per_ml numeric,                -- utilisé uniquement si unit_type = 'ml'
+  density_g_per_unit numeric,              -- grammes pour 1 unité de unit_type : requis si 'ml' (densité) ou 'unit' (poids moyen, ex 1 oeuf ≈ 50g), null si 'grams'
 
-  category_name text,                      -- ex "fruits et légumes", texte libre CIQUAL, un seul niveau
+  category_name text,
 
   -- 5 macros principales, toujours pour 100 g — cache dérivé de `nutrients` pour les aliments CIQUAL
   kcal_per_100g numeric,
@@ -104,15 +119,25 @@ create table foods (
   fat_per_100g numeric,
   fiber_per_100g numeric,
 
-  kcal_from_macros numeric,                -- contrôle qualité (règle 4/4/9), calculé à l'import, jamais affiché
+  expected_kcal numeric,                -- contrôle qualité (règle 4/4/9), calculé à l'import, jamais affiché
 
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
 
   constraint foods_owner_required_if_user
     check (source != 'user' or owner_profile_id is not null),
-  constraint foods_density_only_if_ml
-    check (unit_type = 'ml' or density_g_per_ml is null)
+  constraint foods_macros_required_if_user
+    check (source != 'user' or (
+      kcal_per_100g is not null
+      and protein_per_100g is not null
+      and carbs_per_100g is not null
+      and fat_per_100g is not null
+    )),
+  constraint foods_density_per_unit_type
+    check (
+      (unit_type = 'grams' and density_g_per_unit is null)
+      or (unit_type in ('ml', 'unit') and density_g_per_unit is not null)
+    )
 );
 
 create unique index foods_external_id_unique
@@ -159,16 +184,11 @@ create policy "foods_delete_own"
 
 -- ============================================================
 -- NUTRIENTS
--- Détail COMPLET de tous les nutriments CIQUAL par aliment (macros,
--- vitamines, minéraux, sucres, graisses saturées...). Source de vérité
--- unique, utilisée uniquement par la fiche produit détaillée.
--- N'existe que pour les aliments source='ciqual' — un aliment perso
--- n'a pas de lignes ici (l'utilisateur saisit juste les 5 macros sur foods).
 -- ============================================================
 
 create table nutrients (
-  id bigint generated always as identity primary key,
-  food_id bigint not null references foods(id) on delete cascade,
+  id uuid primary key default uuid_generate_v7(),
+  food_id uuid not null references foods(id) on delete cascade,
   external_id text not null,               -- const_code CIQUAL (identifiant du nutriment)
   name_fr text not null,
   name_en text,
@@ -179,7 +199,7 @@ create table nutrients (
   raw_value_text text,                     -- teneur brute avant conversion : "-", "traces", "<0,5", "12,4"
   value numeric,                           -- teneur convertie, exploitable directement (NULL si not_measured)
 
-  confidence_code confidence_code_enum,    -- A=très fiable à D=moins fiable
+  confidence_code confidence_code_enum,    -- Fiabilité score de A à D
 
   created_at timestamptz not null default now()
 );
@@ -190,25 +210,22 @@ create index nutrients_food_idx on nutrients (food_id);
 
 alter table nutrients enable row level security;
 
--- lecture publique (dictionnaire global, aucune donnée personnelle)
+-- lecture publique (dictionnaire global, aucune donnée personnelle), pas de policy
 create policy "nutrients_select_all"
   on nutrients for select
   using (true);
-
--- pas de policy insert/update/delete : écriture réservée au rôle service (script d'import), hors RLS applicative
 
 -- ============================================================
 -- RECIPES
 -- ============================================================
 
 create table recipes (
-  id bigint generated always as identity primary key,
+  id uuid primary key default uuid_generate_v7(),
   owner_profile_id uuid not null references profiles(id) on delete cascade,
   name text not null,
   servings integer not null check (servings > 0),
-  is_shared boolean not null default false,   -- préparation V1.5, aucune logique/UI dessus en MVP
+  is_shared boolean not null default false,
 
-  -- total de LA RECETTE ENTIÈRE (somme de tous les recipe_items), pas par portion
   calculated_kcal numeric not null default 0,
   calculated_protein numeric not null default 0,
   calculated_carbs numeric not null default 0,
@@ -244,10 +261,10 @@ create policy "recipes_delete_own"
 -- ============================================================
 
 create table recipe_items (
-  id bigint generated always as identity primary key,
-  recipe_id bigint not null references recipes(id) on delete cascade,
-  food_id bigint not null references foods(id) on delete restrict,  -- suppression bloquée si utilisé
-  quantity numeric not null check (quantity > 0),
+  id uuid primary key default uuid_generate_v7(),
+  recipe_id uuid not null references recipes(id) on delete cascade,
+  food_id uuid not null references foods(id) on delete restrict,  -- suppression bloquée si utilisé
+  quantity numeric not null check (quantity > 0),  -- exprimée dans l'unit_type du food (g, ml, ou nombre d'unités)
   created_at timestamptz not null default now()
 );
 
@@ -264,18 +281,28 @@ create policy "recipe_items_select_via_recipe"
 
 create policy "recipe_items_insert_via_recipe"
   on recipe_items for insert
-  with check (recipe_id in (
-    select id from recipes where owner_profile_id = (select id from profiles where user_id = auth.uid())
-  ));
+  with check (
+    recipe_id in (
+      select id from recipes where owner_profile_id = (select id from profiles where user_id = auth.uid())
+    )
+    and food_id in (
+      select id from foods where is_public = true or owner_profile_id = (select id from profiles where user_id = auth.uid())
+    )
+  );
 
 create policy "recipe_items_update_via_recipe"
   on recipe_items for update
   using (recipe_id in (
     select id from recipes where owner_profile_id = (select id from profiles where user_id = auth.uid())
   ))
-  with check (recipe_id in (
-    select id from recipes where owner_profile_id = (select id from profiles where user_id = auth.uid())
-  ));
+  with check (
+    recipe_id in (
+      select id from recipes where owner_profile_id = (select id from profiles where user_id = auth.uid())
+    )
+    and food_id in (
+      select id from foods where is_public = true or owner_profile_id = (select id from profiles where user_id = auth.uid())
+    )
+  );
 
 create policy "recipe_items_delete_via_recipe"
   on recipe_items for delete
@@ -288,7 +315,7 @@ create policy "recipe_items_delete_via_recipe"
 -- ============================================================
 
 create table journal_days (
-  id bigint generated always as identity primary key,
+  id uuid primary key default uuid_generate_v7(),
   profile_id uuid not null references profiles(id) on delete cascade,
   date date not null,
   total_kcal numeric not null default 0,
@@ -313,28 +340,35 @@ create policy "journal_days_insert_own"
   on journal_days for insert
   with check (profile_id = (select id from profiles where user_id = auth.uid()));
 
+-- is_closed ne peut être posé qu'une fois : dès que true, la ligne sort du
+-- périmètre "using" et n'est plus jamais modifiable par l'utilisateur — clôture définitive.
 create policy "journal_days_update_own"
   on journal_days for update
-  using (profile_id = (select id from profiles where user_id = auth.uid()))
+  using (
+    profile_id = (select id from profiles where user_id = auth.uid())
+    and is_closed = false
+  )
   with check (profile_id = (select id from profiles where user_id = auth.uid()));
 
 create policy "journal_days_delete_own"
   on journal_days for delete
-  using (profile_id = (select id from profiles where user_id = auth.uid()));
+  using (
+    profile_id = (select id from profiles where user_id = auth.uid())
+    and is_closed = false
+  );
 
 -- ============================================================
 -- JOURNAL_ENTRIES
 -- ============================================================
 
 create table journal_entries (
-  id bigint generated always as identity primary key,
-  journal_day_id bigint not null references journal_days(id) on delete cascade,
-  food_id bigint references foods(id) on delete set null,
-  recipe_id bigint references recipes(id) on delete set null,
+  id uuid primary key default uuid_generate_v7(),
+  journal_day_id uuid not null references journal_days(id) on delete cascade,
+  food_id uuid references foods(id) on delete set null,
+  recipe_id uuid references recipes(id) on delete set null,
   quantity numeric not null check (quantity > 0),
-  -- unité de quantity : grammes/mL/nb d'unités si food_id, nb de portions (2 décimales max) si recipe_id
 
-  -- snapshot immuable, valeurs TOTALES pour la quantity saisie (déjà multipliées)
+  -- snapshot immuable
   snapshot_name text not null,
   snapshot_kcal numeric not null,
   snapshot_protein numeric not null,
@@ -343,8 +377,9 @@ create table journal_entries (
 
   created_at timestamptz not null default now(),
 
-  constraint journal_entries_food_xor_recipe
-    check (((food_id is not null)::int + (recipe_id is not null)::int) = 1)
+  -- au plus une des deux ; les deux peuvent devenir null
+  constraint journal_entries_food_or_recipe_not_both
+    check (((food_id is not null)::int + (recipe_id is not null)::int) <= 1)
 );
 
 create index journal_entries_day_idx on journal_entries (journal_day_id);
@@ -357,67 +392,84 @@ create policy "journal_entries_select_via_day"
     select id from journal_days where profile_id = (select id from profiles where user_id = auth.uid())
   ));
 
+-- insert/update/delete : uniquement tant que le jour du journal est "aujourd'hui" et pas clôturé.
+-- Passé minuit (date != current_date) ou une fois is_closed = true, l'entrée devient immuable —
+-- c'est ça qui fait office de "snapshot" figé pour snapshot_kcal/protein/carbs/fat.
 create policy "journal_entries_insert_via_day"
   on journal_entries for insert
   with check (journal_day_id in (
-    select id from journal_days where profile_id = (select id from profiles where user_id = auth.uid())
+    select id from journal_days
+    where profile_id = (select id from profiles where user_id = auth.uid())
+      and is_closed = false
+      and date = current_date
   ));
 
 create policy "journal_entries_update_via_day"
   on journal_entries for update
   using (journal_day_id in (
-    select id from journal_days where profile_id = (select id from profiles where user_id = auth.uid())
+    select id from journal_days
+    where profile_id = (select id from profiles where user_id = auth.uid())
+      and is_closed = false
+      and date = current_date
   ))
   with check (journal_day_id in (
-    select id from journal_days where profile_id = (select id from profiles where user_id = auth.uid())
+    select id from journal_days
+    where profile_id = (select id from profiles where user_id = auth.uid())
+      and is_closed = false
+      and date = current_date
   ));
 
 create policy "journal_entries_delete_via_day"
   on journal_entries for delete
   using (journal_day_id in (
-    select id from journal_days where profile_id = (select id from profiles where user_id = auth.uid())
+    select id from journal_days
+    where profile_id = (select id from profiles where user_id = auth.uid())
+      and is_closed = false
+      and date = current_date
   ));
 
 -- ============================================================
--- TABLES PRÉPARÉES POUR LA V1.5 — RLS activée, ZÉRO policy (verrouillées)
+-- RECIPE_LIKES
 -- ============================================================
 
 create table recipe_likes (
-  recipe_id bigint not null references recipes(id) on delete cascade,
+  recipe_id uuid not null references recipes(id) on delete cascade,
   profile_id uuid not null references profiles(id) on delete cascade,
   created_at timestamptz not null default now(),
   primary key (recipe_id, profile_id)
 );
 
 alter table recipe_likes enable row level security;
--- ⚠️ aucune policy créée volontairement : personne n'y accède, même le propriétaire, jusqu'à la V1.5
 
-create table ratings (
-  recipe_id bigint not null references recipes(id) on delete cascade,
+-- ============================================================
+-- RECIPE_RATINGS
+-- ============================================================
+
+create table recipe_ratings (
+  recipe_id uuid not null references recipes(id) on delete cascade,
   profile_id uuid not null references profiles(id) on delete cascade,
   score smallint not null check (score between 1 and 5),
   created_at timestamptz not null default now(),
   primary key (recipe_id, profile_id)
 );
 
-alter table ratings enable row level security;
--- ⚠️ aucune policy créée volontairement : personne n'y accède, même le propriétaire, jusqu'à la V1.5
+alter table recipe_ratings enable row level security;
 
 -- ============================================================
 -- TRIGGERS
 -- ============================================================
-
--- 1. Cache nutrition de la recette (recalculé à chaque insert/update/delete sur recipe_items)
---    Lit directement foods.kcal_per_100g etc. — c'est exactement pour ce genre de lecture
---    fréquente et simple que les 5 macros sont cachées sur `foods`.
 create or replace function recalc_recipe_cache()
-returns trigger as $$
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
 declare
-  target_recipe_id bigint;
+  target_recipe_id uuid;
 begin
   target_recipe_id := coalesce(new.recipe_id, old.recipe_id);
 
-  update recipes r
+  update public.recipes r
   set
     calculated_kcal = coalesce(sub.kcal, 0),
     calculated_protein = coalesce(sub.protein, 0),
@@ -426,19 +478,19 @@ begin
     updated_at = now()
   from (
     select
-      sum(f.kcal_per_100g * ri.quantity / 100.0) as kcal,
-      sum(f.protein_per_100g * ri.quantity / 100.0) as protein,
-      sum(f.carbs_per_100g * ri.quantity / 100.0) as carbs,
-      sum(f.fat_per_100g * ri.quantity / 100.0) as fat
-    from recipe_items ri
-    join foods f on f.id = ri.food_id
+      sum(f.kcal_per_100g * ri.quantity * coalesce(f.density_g_per_unit, 1) / 100.0) as kcal,
+      sum(f.protein_per_100g * ri.quantity * coalesce(f.density_g_per_unit, 1) / 100.0) as protein,
+      sum(f.carbs_per_100g * ri.quantity * coalesce(f.density_g_per_unit, 1) / 100.0) as carbs,
+      sum(f.fat_per_100g * ri.quantity * coalesce(f.density_g_per_unit, 1) / 100.0) as fat
+    from public.recipe_items ri
+    join public.foods f on f.id = ri.food_id
     where ri.recipe_id = target_recipe_id
   ) sub
   where r.id = target_recipe_id;
 
   return null;
 end;
-$$ language plpgsql security definer;
+$$;
 
 create trigger recipe_items_recalc_cache
   after insert or update or delete on recipe_items
@@ -446,20 +498,24 @@ create trigger recipe_items_recalc_cache
 
 -- 2. Agrégat du jour, upsert live tant que non clôturé (figé après clôture)
 create or replace function recalc_journal_day()
-returns trigger as $$
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
 declare
-  target_day_id bigint;
+  target_day_id uuid;
   is_day_closed boolean;
 begin
   target_day_id := coalesce(new.journal_day_id, old.journal_day_id);
 
-  select is_closed into is_day_closed from journal_days where id = target_day_id;
+  select is_closed into is_day_closed from public.journal_days where id = target_day_id;
 
   if is_day_closed then
     return null;  -- jour clôturé : agrégat figé, on ne recalcule plus
   end if;
 
-  update journal_days jd
+  update public.journal_days jd
   set
     total_kcal = coalesce(sub.kcal, 0),
     total_protein = coalesce(sub.protein, 0),
@@ -472,14 +528,14 @@ begin
       sum(snapshot_protein) as protein,
       sum(snapshot_carbs) as carbs,
       sum(snapshot_fat) as fat
-    from journal_entries
+    from public.journal_entries
     where journal_day_id = target_day_id
   ) sub
   where jd.id = target_day_id;
 
   return null;
 end;
-$$ language plpgsql security definer;
+$$;
 
 create trigger journal_entries_recalc_day
   after insert or update or delete on journal_entries
@@ -487,12 +543,15 @@ create trigger journal_entries_recalc_day
 
 -- 3. updated_at automatique
 create or replace function set_updated_at()
-returns trigger as $$
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
 begin
   new.updated_at = now();
   return new;
 end;
-$$ language plpgsql;
+$$;
 
 create trigger profiles_set_updated_at before update on profiles
   for each row execute function set_updated_at();
@@ -500,3 +559,13 @@ create trigger foods_set_updated_at before update on foods
   for each row execute function set_updated_at();
 create trigger recipes_set_updated_at before update on recipes
   for each row execute function set_updated_at();
+
+-- ============================================================
+-- PRIVILÈGES COLONNE PAR COLONNE
+-- ============================================================
+
+revoke update on table recipes from authenticated;
+grant update (name, servings, is_shared) on table recipes to authenticated;
+
+revoke update on table journal_days from authenticated;
+grant update (is_closed) on table journal_days to authenticated;
