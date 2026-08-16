@@ -43,3 +43,6 @@ next-env.d.ts
 
 .vercel
 .env*
+
+# données de référence CIQUAL (brutes, re-téléchargeables, pas du code source)
+/data/ciqual/

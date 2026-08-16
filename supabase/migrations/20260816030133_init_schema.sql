@@ -141,8 +141,7 @@ create table foods (
 );
 
 create unique index foods_external_id_unique
-  on foods (source, external_id)
-  where external_id is not null;
+  on foods (source, external_id);
 
 create index foods_owner_idx on foods (owner_profile_id);
 create index foods_name_trgm_idx on foods using gin (name gin_trgm_ops);
@@ -191,7 +190,6 @@ create table nutrients (
   food_id uuid not null references foods(id) on delete cascade,
   external_id text not null,               -- const_code CIQUAL (identifiant du nutriment)
   name_fr text not null,
-  name_en text,
   unit text not null,                      -- normalisé à l'import : g | mg | µg | kcal | kJ
   category nutrient_category_enum not null default 'other',
 
