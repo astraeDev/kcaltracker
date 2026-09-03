@@ -1,7 +1,8 @@
-// EXTRACT fichier XML (text) -> (objet)
+// EXTRACT fichier XML (text) -> (objet), validé par un schéma Zod
 
 import { readFileSync } from 'node:fs'
 import { XMLParser } from 'fast-xml-parser'
+import { z } from 'zod'
 
 // Un BOM UTF-8 = 3 octets invisibles (U+FEFF) au tout début du fichier à retirer
 function stripBom(text: string): string {
@@ -21,15 +22,21 @@ const parser = new XMLParser({
   trimValues: true,
 })
 
-export function loadXmlRows<T>(filePath: string, rowTag: RowTag): T[] {
+
+
+export function loadXmlRows<T>(filePath: string, rowTag: RowTag, rowSchema: z.ZodType<T>): T[] {
   const raw = readFileSync(filePath, 'utf-8')
   const parsed = parser.parse(stripBom(raw))
   const rows = parsed?.TABLE?.[rowTag]
 
-  // Throw si forme non attendue (fichier, balise...) 
+  // Throw si forme non attendue (fichier, balise...)
   if (!Array.isArray(rows)) {
     throw new Error(`Structure inattendue dans ${filePath} : TABLE.${rowTag} n'est pas un tableau`)
   }
 
-  return rows as T[]
+  const result = z.array(rowSchema).safeParse(rows)
+  if (!result.success) {
+    throw new Error(`${filePath} : lignes ${rowTag} invalides —\n${z.prettifyError(result.error)}`)
+  }
+  return result.data
 }
