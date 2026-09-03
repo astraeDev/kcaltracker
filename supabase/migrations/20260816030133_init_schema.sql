@@ -35,15 +35,15 @@ create type gender_enum as enum ('male', 'female');
 
 create type activity_level_enum as enum (
   'sedentary',   -- sédentaire
-  'light',       -- légèrement actif (1-3j/sem)
-  'moderate',    -- modérément actif (3-5j/sem)
-  'active',      -- très actif (6-7j/sem)
-  'extreme'      -- extrêmement actif (2x/jour)
+  'light',       -- (1-3j/sem)
+  'moderate',    -- (3-5j/sem)
+  'active',      -- (6-7j/sem)
+  'extreme'      -- (2x/jour)
 );
 
 create type goal_type_enum as enum ('maintain', 'gain', 'lose');
 
-create type food_source_enum as enum ('ciqual', 'user');
+create type food_source_enum as enum ('ciqual', 'user', 'off');
 
 create type unit_type_enum as enum ('grams', 'ml', 'unit');
 
@@ -71,6 +71,10 @@ create table profiles (
   activity_level activity_level_enum not null,
   goal_type goal_type_enum not null default 'maintain',
   daily_kcal_target numeric not null,
+  daily_protein_target_g numeric not null,
+  daily_carbs_target_g numeric not null,
+  daily_fat_target_g numeric not null,
+  health_data_consent_at timestamptz not null,  -- horodatage du consentement RGPD explicite (distinct des CGU), jamais réécrit
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -93,6 +97,40 @@ create policy "profiles_update_own"
 create policy "profiles_delete_own"
   on profiles for delete
   using (user_id = auth.uid());
+
+-- ============================================================
+-- WEIGHT_LOGS
+-- ============================================================
+
+create table weight_logs (
+  id uuid primary key default uuid_generate_v7(),
+  profile_id uuid not null references profiles(id) on delete cascade,
+  weight_kg numeric not null check (weight_kg > 0),
+  logged_at date not null default (now() at time zone 'Europe/Paris')::date,
+  created_at timestamptz not null default now(),
+  unique (profile_id, logged_at)  -- une pesée par jour
+);
+
+create index weight_logs_profile_idx on weight_logs (profile_id, logged_at desc);
+
+alter table weight_logs enable row level security;
+
+create policy "weight_logs_select_own"
+  on weight_logs for select
+  using (profile_id = (select id from profiles where user_id = auth.uid()));
+
+create policy "weight_logs_insert_own"
+  on weight_logs for insert
+  with check (profile_id = (select id from profiles where user_id = auth.uid()));
+
+create policy "weight_logs_update_own"
+  on weight_logs for update
+  using (profile_id = (select id from profiles where user_id = auth.uid()))
+  with check (profile_id = (select id from profiles where user_id = auth.uid()));
+
+create policy "weight_logs_delete_own"
+  on weight_logs for delete
+  using (profile_id = (select id from profiles where user_id = auth.uid()));
 
 -- ============================================================
 -- FOODS
@@ -341,7 +379,7 @@ create policy "journal_days_delete_own"
   on journal_days for delete
   using (
     profile_id = (select id from profiles where user_id = auth.uid())
-    and current_date <= date + 1
+    and (now() at time zone 'Europe/Paris')::date <= date + 1
   );
 
 -- ============================================================
@@ -387,7 +425,7 @@ create policy "journal_entries_insert_via_day"
   with check (journal_day_id in (
     select id from journal_days
     where profile_id = (select id from profiles where user_id = auth.uid())
-      and current_date <= date + 1
+      and (now() at time zone 'Europe/Paris')::date <= date + 1
   ));
 
 create policy "journal_entries_update_via_day"
@@ -395,12 +433,12 @@ create policy "journal_entries_update_via_day"
   using (journal_day_id in (
     select id from journal_days
     where profile_id = (select id from profiles where user_id = auth.uid())
-      and current_date <= date + 1
+      and (now() at time zone 'Europe/Paris')::date <= date + 1
   ))
   with check (journal_day_id in (
     select id from journal_days
     where profile_id = (select id from profiles where user_id = auth.uid())
-      and current_date <= date + 1
+      and (now() at time zone 'Europe/Paris')::date <= date + 1
   ));
 
 create policy "journal_entries_delete_via_day"
@@ -408,7 +446,7 @@ create policy "journal_entries_delete_via_day"
   using (journal_day_id in (
     select id from journal_days
     where profile_id = (select id from profiles where user_id = auth.uid())
-      and current_date <= date + 1
+      and (now() at time zone 'Europe/Paris')::date <= date + 1
   ));
 
 -- ============================================================
@@ -480,9 +518,6 @@ create trigger recipe_items_recalc_cache
   for each row execute function recalc_recipe_cache();
 
 -- 2. Agrégat du jour, upsert live tant que non clôturé (figé après clôture).
--- Garde-fou utile même si la RLS bloque déjà les écritures normales passé le délai :
--- un `on delete set null` (food/recipe supprimée) ou une écriture service_role
--- contournent la RLS mais déclenchent quand même ce trigger.
 create or replace function recalc_journal_day()
 returns trigger
 language plpgsql
@@ -497,7 +532,7 @@ begin
 
   select date into day_date from public.journal_days where id = target_day_id;
 
-  if current_date > day_date + 1 then
+  if (now() at time zone 'Europe/Paris')::date > day_date + 1 then
     return null;  -- jour clôturé (au-delà du jour de grâce) : agrégat figé, on ne recalcule plus
   end if;
 
@@ -527,7 +562,42 @@ create trigger journal_entries_recalc_day
   after insert or update or delete on journal_entries
   for each row execute function recalc_journal_day();
 
--- 3. updated_at automatique
+-- 3. Synchronise profiles.weight_kg avec la pesée la plus récente de weight_logs.
+-- weight_kg (poids "actuel", utilisé pour le calcul BMR/DET) n'est plus modifiable en direct
+-- sur profiles (voir GRANT/REVOKE) : toute mise à jour de poids passe par un insert ici.
+create or replace function sync_profile_weight()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  target_profile_id uuid;
+  latest_weight numeric;
+begin
+  target_profile_id := coalesce(new.profile_id, old.profile_id);
+
+  select weight_kg into latest_weight
+  from public.weight_logs
+  where profile_id = target_profile_id
+  order by logged_at desc
+  limit 1;
+
+  if latest_weight is not null then
+    update public.profiles
+    set weight_kg = latest_weight
+    where id = target_profile_id;
+  end if;
+
+  return null;
+end;
+$$;
+
+create trigger weight_logs_sync_profile
+  after insert or update or delete on weight_logs
+  for each row execute function sync_profile_weight();
+
+-- 4. updated_at automatique
 create or replace function set_updated_at()
 returns trigger
 language plpgsql
@@ -552,3 +622,13 @@ create trigger recipes_set_updated_at before update on recipes
 
 revoke update on table recipes from authenticated;
 grant update (name, servings, is_shared) on table recipes to authenticated;
+
+-- weight_kg : jamais modifiable en direct, uniquement via un insert dans weight_logs (trigger sync_profile_weight)
+-- health_data_consent_at : horodatage figé du consentement RGPD initial, jamais réécrit
+-- id/user_id/created_at/updated_at : jamais modifiables (bonus de sécurité, pas seulement pour weight_kg)
+revoke update on table profiles from authenticated;
+grant update (
+  name, avatar_url, bio, is_public,
+  gender, birth_date, height_cm, activity_level, goal_type,
+  daily_kcal_target, daily_protein_target_g, daily_carbs_target_g, daily_fat_target_g
+) on table profiles to authenticated;
