@@ -70,13 +70,22 @@ create table profiles (
   weight_kg numeric not null,
   activity_level activity_level_enum not null,
   goal_type goal_type_enum not null default 'maintain',
+  weight_change_kg numeric,                -- saisi par l'utilisateur 
+  weekly_rate_kg numeric,                  -- rythme proposé par l'app, ajustable par l'user selon contrainte santé (0,25-1 kg/semaine)
   daily_kcal_target numeric not null,
   daily_protein_target_g numeric not null,
   daily_carbs_target_g numeric not null,
   daily_fat_target_g numeric not null,
   health_data_consent_at timestamptz not null,  -- horodatage du consentement RGPD explicite (distinct des CGU), jamais réécrit
   created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
+  updated_at timestamptz not null default now(),
+
+  --cohérence avec goal_type + grandeur positive
+  constraint profiles_weight_goal_consistency
+    check (
+      (goal_type = 'maintain' and weight_change_kg is null and weekly_rate_kg is null)
+      or (goal_type != 'maintain' and weight_change_kg > 0 and weekly_rate_kg > 0)
+    )
 );
 
 alter table profiles enable row level security;
@@ -142,7 +151,7 @@ create table foods (
   owner_profile_id uuid references profiles(id) on delete cascade,  -- null si CIQUAL
   source food_source_enum not null default 'user',
   external_id text,                        -- alim_code CIQUAL, clé stable pour upsert
-  is_shared boolean not null default false,   
+  is_shared boolean not null default false,
   is_public boolean not null default false,   -- true pour les aliments CIQUAL
 
   unit_type unit_type_enum not null default 'grams',
@@ -392,6 +401,9 @@ create table journal_entries (
   food_id uuid references foods(id) on delete set null,
   recipe_id uuid references recipes(id) on delete set null,
   quantity numeric not null check (quantity > 0),
+  -- unité selon le lien : food_id renseigné -> unit_type du food (g/ml/unité) ;
+  -- recipe_id renseigné -> nombre de portions de la recette ;
+  -- aucun des deux (saisie libre/quick-add) -> purement informatif, pas d'unité DB
 
   -- snapshot immuable
   snapshot_name text not null,
@@ -630,5 +642,6 @@ revoke update on table profiles from authenticated;
 grant update (
   name, avatar_url, bio, is_public,
   gender, birth_date, height_cm, activity_level, goal_type,
+  weight_change_kg, weekly_rate_kg,
   daily_kcal_target, daily_protein_target_g, daily_carbs_target_g, daily_fat_target_g
 ) on table profiles to authenticated;
