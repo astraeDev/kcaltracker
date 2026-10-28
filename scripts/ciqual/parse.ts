@@ -1,18 +1,3 @@
-// ============================================================================
-// orchestrateur 
-// -> lit 4 fichiers XML, les joint, applique convertTeneur + classifyNutrient,
-// -> écrit data/ciqual/parsed.json
-// COMPO = fichier central / ALIM et CONST = dictionnaires
-//
-//   ALIM_GRP      ──┐                         CONST ──┐
-//   (alim_grp_code )│                                 │
-//                                                     │
-//   ALIM      ──────┤                                 │ (const_code)
-//   (alim_code)     │                                 │
-//                   └─────────── COMPO ───────────────┘
-//                    (alim_code, const_code, teneur, code_confiance)
-// ============================================================================
-
 import { writeFileSync } from 'node:fs'
 import { z } from 'zod'
 import { loadXmlRows } from './xml-load'
@@ -24,77 +9,69 @@ import {
   constRowSchema,
   compoRowSchema,
   parsedFoodSchema,
+  confidenceCodeSchema,
   type CompoRow,
+  type ConfidenceCode,
   type ParsedFood,
   type ParsedNutrient,
 } from './types'
 
-// --- Extraction de l'unité depuis le nom CIQUAL -----------------------------
-// "Vitamine C (mg/100 g)" -> { name: "Vitamine C", unit: "mg" }
-// Capture restreinte aux lettres + µ : un [^/]+ trop permissif traverse les
-// parenthèses imbriquées ("Alcool (éthanol) (g/100 g)" -> "éthanol) (g").
-const UNIT_RE = /\(([a-zA-Zµ]+)\/100\s*g\)\s*$/
+// --- Nom CIQUAL "Protéines… (g/100 g)" -> { name, unit } --------------------
+const UNIT_REGEX = /\(([a-zA-Zµ]+)\/100\s*g\)\s*$/
 
-function stripUnitSuffix(nameWithUnit: string): { name: string; unit: string } {
-  const m = nameWithUnit.match(UNIT_RE)
+function splitUnit(nameWithUnit: string): { name: string; unit: string } {
+  const m = nameWithUnit.match(UNIT_REGEX)
   if (!m) throw new Error(`Unité introuvable dans "${nameWithUnit}"`)
   return { name: nameWithUnit.slice(0, m.index).trim(), unit: m[1] }
 }
 
-// --- code_confiance -> confidence_code --------------------------------------
-// Valeurs réelles : "A" "B" "C" "D" ou "" (non renseigné). Tout le reste -> null.
-const CONFIDENCE_CODES = new Set(['A', 'B', 'C', 'D'])
-function parseConfidenceCode(raw: string): 'A' | 'B' | 'C' | 'D' | null {
-  return CONFIDENCE_CODES.has(raw) ? (raw as 'A' | 'B' | 'C' | 'D') : null
+// --- code_confiance -> 'A'..'D', ou null si vide/inconnu -------------------
+function parseConfidenceCode(raw: string): ConfidenceCode | null {
+  return confidenceCodeSchema.safeParse(raw).data ?? null
 }
 
-// Formes de sortie (ParsedFood / ParsedNutrient) : définies dans types.ts comme
-// schémas Zod, partagées avec import.ts qui revalide parsed.json avant la DB.
-
-// const_code des 5 macros "résumé" de foods (choisis/confirmés plus tôt).
-const ENERGY_KCAL = '328' // méthode réglementaire UE (pas 333)
-const PROTEIN = '25003' // N x 6.25 (pas 25000, méthode Jones)
+// --- const_code des 5 macros hissées au niveau de l'aliment ---------------
+const ENERGY_KCAL = '328' // méthode réglementaire UE 1169/2011 (pas 333 = facteur Jones)
+const PROTEIN = '25003' // N x 6.25 (pas 25000 = facteur Jones)
 const CARBS = '31000'
 const FAT = '40000'
 const FIBER = '34100'
 
-// Autres composants énergétiques, pour le contrôle qualité (option C).
+// --- Autres apports énergétiques, uniquement pour le contrôle qualité -----
 const ALCOHOL = '60000'
 const POLYOLS = '34000'
 const ORGANIC_ACIDS = '65000'
 
 function main() {
-  // -- 1. Chargement --
+  // ------------------ Chargement des 4 fichiers XML ------------------
   const alims = loadXmlRows('data/ciqual/alim_2025_11_03.xml', 'ALIM', alimRowSchema)
   const groups = loadXmlRows('data/ciqual/alim_grp_2025_11_03.xml', 'ALIM_GRP', alimGrpRowSchema)
   const consts = loadXmlRows('data/ciqual/const_2025_11_03.xml', 'CONST', constRowSchema)
   const compos = loadXmlRows('data/ciqual/compo_2025_11_03.xml', 'COMPO', compoRowSchema)
 
-  // -- 2. Dictionnaires (Map = clé -> valeur en accès instantané) --
-  // alim_grp_code -> libellé français du groupe.
-  const groupNameByCode = new Map(groups.map((g) => [g.alim_grp_code, g.alim_grp_nom_fr]))
+  // ------------------ Index (Map = get O(1), pas de find dans la boucle) ------------------
+  // annuaire groupe (ex: 05 = "Produits laitiers")
+  const groupByCode = new Map(groups.map((g) => [g.alim_grp_code, g.alim_grp_nom_fr]))
 
-  // const_code -> { nom nettoyé, unité }. stripUnitSuffix appelé 74 fois ici,
-  // pas 257 816 fois plus bas.
-  const constByCode = new Map(consts.map((c) => [c.const_code, stripUnitSuffix(c.const_nom_fr)]))
+  // const_code -> { name, unit }. splitUnit tourné 74 fois ici, pas 257 816 fois plus bas.
+  const constByCode = new Map(consts.map((c) => [c.const_code, splitUnit(c.const_nom_fr)]))
 
-  // COMPO regroupé par alim_code : pour un aliment, toutes ses lignes d'un coup.
-  // Sans ce regroupement (fait une fois), il faudrait reparcourir 257 816 lignes
-  // pour chacun des 3484 aliments (~900 M d'opérations).
-  const compoByAlimCode = new Map<string, CompoRow[]>()
+  // annuaire aliment -> 74 nutriments, un seul parcours des 257 816 lignes.
+  const compoByAlim = new Map<string, CompoRow[]>()
   for (const compo of compos) {
-    const list = compoByAlimCode.get(compo.alim_code)
+    const list = compoByAlim.get(compo.alim_code)
     if (list) list.push(compo)
-    else compoByAlimCode.set(compo.alim_code, [compo])
+    else compoByAlim.set(compo.alim_code, [compo])
   }
 
   let realWarnings = 0
   let explainedWarnings = 0
 
-  // -- 3. Un ParsedFood par aliment --
+  // ------------------ Un ParsedFood par aliment ------------------
   const foods: ParsedFood[] = alims.map((alim) => {
-    const rows = compoByAlimCode.get(alim.alim_code) ?? []
+    const rows = compoByAlim.get(alim.alim_code) ?? []
 
+    // Chaque ligne COMPO -> un ParsedNutrient (jointure CONST + convertTeneur + classifyNutrient)
     const nutrients: ParsedNutrient[] = rows.map((row) => {
       const constDef = constByCode.get(row.const_code)
       if (!constDef) {
@@ -113,33 +90,30 @@ function main() {
       }
     })
 
-    // Valeur d'un nutriment de CET aliment par const_code (<= 74 éléments, find OK).
-    const valueOf = (code: string) => nutrients.find((n) => n.externalId === code)?.value ?? null
+    // Valeur d'un nutriment de CET aliment (<= 74 éléments, find OK).
+    const valueByCode = (code: string) => nutrients.find((n) => n.externalId === code)?.value ?? null
 
-    const kcalPer100g = valueOf(ENERGY_KCAL)
-    const proteinPer100g = valueOf(PROTEIN)
-    const carbsPer100g = valueOf(CARBS)
-    const fatPer100g = valueOf(FAT)
-    const fiberPer100g = valueOf(FIBER)
+    const kcalPer100g = valueByCode(ENERGY_KCAL)
+    const proteinPer100g = valueByCode(PROTEIN)
+    const carbsPer100g = valueByCode(CARBS)
+    const fatPer100g = valueByCode(FAT)
+    const fiberPer100g = valueByCode(FIBER)
 
-    // -- Contrôle qualité (option C) --
-    // expectedKcal stocké = 4/4/9 simple. On signale un écart > 15 % SAUF si
-    // l'aliment contient un composant énergétique que le 4/4/9 ignore (alcool,
-    // polyols, beaucoup de fibres, acides organiques) : dans ce cas l'écart est
-    // structurel, pas un bug. Ne reste "RÉEL" que ce qui pourrait être notre bug.
-    let expectedKcal: number | null = null
-    if (kcalPer100g !== null && proteinPer100g !== null && carbsPer100g !== null && fatPer100g !== null) {
-      expectedKcal = proteinPer100g * 4 + carbsPer100g * 4 + fatPer100g * 9
+    // ------------------ Contrôle qualité ------------------
+    // Énergie attendue = modèle 4/4/9 (facteurs d'Atwater simplifiés).
+    const expectedKcal =
+      proteinPer100g !== null && carbsPer100g !== null && fatPer100g !== null
+        ? proteinPer100g * 4 + carbsPer100g * 4 + fatPer100g * 9
+        : null
 
-      // Un vrai bug (unité ratée, mauvais const_code) décale de dizaines de kcal.
-      // On exige un écart significatif EN RELATIF (> 15 %) ET EN ABSOLU (> 20 kcal) :
-      // ça élimine le bruit des aliments à ~15 kcal (2-3 kcal d'écart = 20 % pour rien).
-      const gap = Math.abs(expectedKcal - kcalPer100g) / kcalPer100g
-      const gapAbs = Math.abs(expectedKcal - kcalPer100g)
-      if (gap > 0.15 && gapAbs > 20) {
-        const alcohol = valueOf(ALCOHOL) ?? 0
-        const polyols = valueOf(POLYOLS) ?? 0
-        const organicAcids = valueOf(ORGANIC_ACIDS) ?? 0
+    if (expectedKcal !== null && kcalPer100g !== null && kcalPer100g > 0) {
+      const gapRatio = Math.abs(expectedKcal - kcalPer100g) / kcalPer100g
+      const gapKcal = Math.abs(expectedKcal - kcalPer100g)
+
+      if (gapRatio > 0.15 && gapKcal > 20) {
+        const alcohol = valueByCode(ALCOHOL) ?? 0
+        const polyols = valueByCode(POLYOLS) ?? 0
+        const organicAcids = valueByCode(ORGANIC_ACIDS) ?? 0
         const fiber = fiberPer100g ?? 0
         const extras = [
           alcohol > 0 && `alcool ${alcohol}g`,
@@ -151,12 +125,12 @@ function main() {
         if (extras.length > 0) {
           explainedWarnings++
           console.warn(
-            `QA ignoré  ${alim.alim_code} (${alim.alim_nom_fr}) — écart ${(gap * 100).toFixed(0)}% expliqué par ${extras.join(', ')}`
+            `QA ignoré  ${alim.alim_code} (${alim.alim_nom_fr}) — écart ${(gapRatio * 100).toFixed(0)}% expliqué par ${extras.join(', ')}`
           )
         } else {
           realWarnings++
           console.warn(
-            `QA RÉEL    ${alim.alim_code} (${alim.alim_nom_fr}) — déclaré ${kcalPer100g} kcal, 4/4/9 ~${expectedKcal.toFixed(0)} (écart ${(gap * 100).toFixed(0)}%)`
+            `QA RÉEL    ${alim.alim_code} (${alim.alim_nom_fr}) — déclaré ${kcalPer100g} kcal, 4/4/9 ~${expectedKcal.toFixed(0)} (écart ${(gapRatio * 100).toFixed(0)}%)`
           )
         }
       }
@@ -165,7 +139,7 @@ function main() {
     return {
       externalId: alim.alim_code,
       name: alim.alim_nom_fr,
-      categoryName: groupNameByCode.get(alim.alim_grp_code) ?? null,
+      categoryName: groupByCode.get(alim.alim_grp_code) ?? null,
       kcalPer100g,
       proteinPer100g,
       carbsPer100g,
@@ -176,9 +150,7 @@ function main() {
     }
   })
 
-  // -- 4. Auto-contrôle puis écriture --
-  // On revalide ce qu'on a construit contre le schéma partagé : si parse.ts et
-  // types.ts divergent un jour, on le voit ici, pas dans import.ts face à la DB.
+  // ------------------ Revalidation (frontière de sortie) & écriture ------------------
   const validated = z.array(parsedFoodSchema).parse(foods)
 
   writeFileSync('data/ciqual/parsed.json', JSON.stringify(validated, null, 2))
